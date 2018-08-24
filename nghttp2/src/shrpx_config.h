@@ -341,6 +341,10 @@ constexpr auto SHRPX_OPT_NO_ADD_X_FORWARDED_PROTO =
     StringRef::from_lit("no-add-x-forwarded-proto");
 constexpr auto SHRPX_OPT_NO_STRIP_INCOMING_X_FORWARDED_PROTO =
     StringRef::from_lit("no-strip-incoming-x-forwarded-proto");
+constexpr auto SHRPX_OPT_OCSP_STARTUP = StringRef::from_lit("ocsp-startup");
+constexpr auto SHRPX_OPT_NO_VERIFY_OCSP = StringRef::from_lit("no-verify-ocsp");
+constexpr auto SHRPX_OPT_VERIFY_CLIENT_TOLERATE_EXPIRED =
+    StringRef::from_lit("verify-client-tolerate-expired");
 
 constexpr size_t SHRPX_OBFUSCATED_NODE_LENGTH = 8;
 
@@ -354,6 +358,31 @@ enum shrpx_session_affinity {
   AFFINITY_NONE,
   // Client IP affinity
   AFFINITY_IP,
+  // Cookie based affinity
+  AFFINITY_COOKIE,
+};
+
+enum shrpx_cookie_secure {
+  // Secure attribute of session affinity cookie is determined by the
+  // request scheme.
+  COOKIE_SECURE_AUTO,
+  // Secure attribute of session affinity cookie is always set.
+  COOKIE_SECURE_YES,
+  // Secure attribute of session affinity cookie is always unset.
+  COOKIE_SECURE_NO,
+};
+
+struct AffinityConfig {
+  // Type of session affinity.
+  shrpx_session_affinity type;
+  struct {
+    // Name of a cookie to use.
+    StringRef name;
+    // Path which a cookie is applied to.
+    StringRef path;
+    // Secure attribute
+    shrpx_cookie_secure secure;
+  } cookie;
 };
 
 enum shrpx_forwarded_param {
@@ -434,6 +463,10 @@ struct DownstreamAddrConfig {
   bool tls;
   // true if dynamic DNS is enabled
   bool dns;
+  // true if :scheme pseudo header field should be upgraded to secure
+  // variant (e.g., "https") when forwarding request to a backend
+  // connected by TLS connection.
+  bool upgrade_scheme;
 };
 
 // Mapping hash to idx which is an index into
@@ -447,15 +480,15 @@ struct AffinityHash {
 
 struct DownstreamAddrGroupConfig {
   DownstreamAddrGroupConfig(const StringRef &pattern)
-      : pattern(pattern), affinity(AFFINITY_NONE), redirect_if_not_tls(false) {}
+      : pattern(pattern), affinity{AFFINITY_NONE}, redirect_if_not_tls(false) {}
 
   StringRef pattern;
   std::vector<DownstreamAddrConfig> addrs;
   // Bunch of session affinity hash.  Only used if affinity ==
   // AFFINITY_IP.
   std::vector<AffinityHash> affinity_hash;
-  // Session affinity
-  shrpx_session_affinity affinity;
+  // Cookie based session affinity configuration.
+  AffinityConfig affinity;
   // true if this group requires that client connection must be TLS,
   // and the request must be redirected to https URI.
   bool redirect_if_not_tls;
@@ -561,6 +594,8 @@ struct TLSConfig {
     ev_tstamp update_interval;
     StringRef fetch_ocsp_response_file;
     bool disabled;
+    bool startup;
+    bool no_verify;
   } ocsp;
 
   // Client verification configurations
@@ -569,6 +604,8 @@ struct TLSConfig {
     // certificate validation
     StringRef cacert;
     bool enabled;
+    // true if we accept an expired client certificate.
+    bool tolerate_expired;
   } client_verify;
 
   // Client (backend connection) TLS configuration.
@@ -1043,8 +1080,10 @@ enum {
   SHRPX_OPTID_NO_SERVER_PUSH,
   SHRPX_OPTID_NO_SERVER_REWRITE,
   SHRPX_OPTID_NO_STRIP_INCOMING_X_FORWARDED_PROTO,
+  SHRPX_OPTID_NO_VERIFY_OCSP,
   SHRPX_OPTID_NO_VIA,
   SHRPX_OPTID_NPN_LIST,
+  SHRPX_OPTID_OCSP_STARTUP,
   SHRPX_OPTID_OCSP_UPDATE_INTERVAL,
   SHRPX_OPTID_PADDING,
   SHRPX_OPTID_PID_FILE,
@@ -1090,6 +1129,7 @@ enum {
   SHRPX_OPTID_USER,
   SHRPX_OPTID_VERIFY_CLIENT,
   SHRPX_OPTID_VERIFY_CLIENT_CACERT,
+  SHRPX_OPTID_VERIFY_CLIENT_TOLERATE_EXPIRED,
   SHRPX_OPTID_WORKER_FRONTEND_CONNECTIONS,
   SHRPX_OPTID_WORKER_READ_BURST,
   SHRPX_OPTID_WORKER_READ_RATE,
@@ -1108,20 +1148,26 @@ int option_lookup_token(const char *name, size_t namelen);
 // stored into the object pointed by |config|. This function returns 0
 // if it succeeds, or -1.  The |included_set| contains the all paths
 // already included while processing this configuration, to avoid loop
-// in --include option.
+// in --include option.  The |pattern_addr_indexer| contains a pair of
+// pattern of backend, and its index in DownstreamConfig::addr_groups.
+// It is introduced to speed up loading configuration file with lots
+// of backends.
 int parse_config(Config *config, const StringRef &opt, const StringRef &optarg,
-                 std::set<StringRef> &included_set);
+                 std::set<StringRef> &included_set,
+                 std::map<StringRef, size_t> &pattern_addr_indexer);
 
 // Similar to parse_config() above, but additional |optid| which
 // should be the return value of option_lookup_token(opt).
 int parse_config(Config *config, int optid, const StringRef &opt,
-                 const StringRef &optarg, std::set<StringRef> &included_set);
+                 const StringRef &optarg, std::set<StringRef> &included_set,
+                 std::map<StringRef, size_t> &pattern_addr_indexer);
 
 // Loads configurations from |filename| and stores them in |config|.
 // This function returns 0 if it succeeds, or -1.  See parse_config()
 // for |include_set|.
 int load_config(Config *config, const char *filename,
-                std::set<StringRef> &include_set);
+                std::set<StringRef> &include_set,
+                std::map<StringRef, size_t> &pattern_addr_indexer);
 
 // Parses header field in |optarg|.  We expect header field is formed
 // like "NAME: VALUE".  We require that NAME is non empty string.  ":"

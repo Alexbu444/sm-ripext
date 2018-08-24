@@ -270,8 +270,8 @@ int Http2Session::disconnect(bool hard) {
   // When deleting Http2DownstreamConnection, it calls this object's
   // remove_downstream_connection().  The multiple
   // Http2DownstreamConnection objects belong to the same
-  // ClientHandler object if upstream is h2 or SPDY.  So be careful
-  // when you delete ClientHandler here.
+  // ClientHandler object if upstream is h2.  So be careful when you
+  // delete ClientHandler here.
   //
   // We allow creating new pending Http2DownstreamConnection with this
   // object.  Upstream::on_downstream_reset() may add
@@ -334,6 +334,7 @@ int Http2Session::resolve_name() {
     return 0;
   default:
     assert(0);
+    abort();
   }
 }
 
@@ -576,11 +577,11 @@ int Http2Session::initiate_connection() {
       }
     }
 
-    on_write_ = &Http2Session::downstream_write;
-    on_read_ = &Http2Session::downstream_read;
-
     // We have been already connected when no TLS and proxy is used.
     if (state_ == PROXY_CONNECTED) {
+      on_read_ = &Http2Session::read_noop;
+      on_write_ = &Http2Session::write_noop;
+
       return connected();
     }
 
@@ -816,9 +817,9 @@ int on_stream_close_callback(nghttp2_session *session, int32_t stream_id,
                              uint32_t error_code, void *user_data) {
   auto http2session = static_cast<Http2Session *>(user_data);
   if (LOG_ENABLED(INFO)) {
-    SSLOG(INFO, http2session) << "Stream stream_id=" << stream_id
-                              << " is being closed with error code "
-                              << error_code;
+    SSLOG(INFO, http2session)
+        << "Stream stream_id=" << stream_id
+        << " is being closed with error code " << error_code;
   }
   auto sd = static_cast<StreamData *>(
       nghttp2_session_get_stream_user_data(session, stream_id));
@@ -1144,7 +1145,7 @@ int on_response_headers(Http2Session *http2session, Downstream *downstream,
 
   if (downstream->get_upgraded()) {
     resp.connection_close = true;
-    // On upgrade sucess, both ends can send data
+    // On upgrade success, both ends can send data
     if (upstream->resume_read(SHRPX_NO_BUFFER, downstream, 0) != 0) {
       // If resume_read fails, just drop connection. Not ideal.
       delete handler;
@@ -1152,8 +1153,8 @@ int on_response_headers(Http2Session *http2session, Downstream *downstream,
     }
     downstream->set_request_state(Downstream::HEADER_COMPLETE);
     if (LOG_ENABLED(INFO)) {
-      SSLOG(INFO, http2session) << "HTTP upgrade success. stream_id="
-                                << frame->hd.stream_id;
+      SSLOG(INFO, http2session)
+          << "HTTP upgrade success. stream_id=" << frame->hd.stream_id;
     }
   } else {
     auto content_length = resp.fs.header(http2::HD_CONTENT_LENGTH);
@@ -1519,7 +1520,7 @@ int on_frame_not_send_callback(nghttp2_session *session,
 
     if (upstream->on_downstream_reset(downstream, false)) {
       // This should be done for h1 upstream only.  Deleting
-      // ClientHandler for h2 or SPDY upstream may lead to crash.
+      // ClientHandler for h2 upstream may lead to crash.
       delete upstream->get_client_handler();
     }
 
@@ -1641,11 +1642,16 @@ int Http2Session::connection_made() {
 
   state_ = Http2Session::CONNECTED;
 
+  on_write_ = &Http2Session::downstream_write;
+  on_read_ = &Http2Session::downstream_read;
+
   if (addr_->tls) {
     const unsigned char *next_proto = nullptr;
     unsigned int next_proto_len = 0;
 
+#ifndef OPENSSL_NO_NEXTPROTONEG
     SSL_get0_next_proto_negotiated(conn_.tls.ssl, &next_proto, &next_proto_len);
+#endif // !OPENSSL_NO_NEXTPROTONEG
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
     if (!next_proto) {
       SSL_get0_alpn_selected(conn_.tls.ssl, &next_proto, &next_proto_len);
@@ -2115,7 +2121,10 @@ int Http2Session::write_tls() {
   for (;;) {
     if (wb_.rleft() > 0) {
       auto iovcnt = wb_.riovec(&iov, 1);
-      assert(iovcnt == 1);
+      if (iovcnt != 1) {
+        assert(0);
+        return -1;
+      }
       auto nwrite = conn_.write_tls(iov.iov_base, iov.iov_len);
 
       if (nwrite == 0) {

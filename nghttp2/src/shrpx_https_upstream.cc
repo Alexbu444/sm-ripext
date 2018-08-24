@@ -150,8 +150,8 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
     } else {
       if (req.fs.num_fields() >= httpconf.max_request_header_fields) {
         if (LOG_ENABLED(INFO)) {
-          ULOG(INFO, upstream) << "Too many header field num="
-                               << req.fs.num_fields() + 1;
+          ULOG(INFO, upstream)
+              << "Too many header field num=" << req.fs.num_fields() + 1;
         }
         downstream->set_request_state(
             Downstream::HTTP1_REQUEST_HEADER_TOO_LARGE);
@@ -166,8 +166,8 @@ int htp_hdr_keycb(http_parser *htp, const char *data, size_t len) {
     } else {
       if (req.fs.num_fields() >= httpconf.max_request_header_fields) {
         if (LOG_ENABLED(INFO)) {
-          ULOG(INFO, upstream) << "Too many header field num="
-                               << req.fs.num_fields() + 1;
+          ULOG(INFO, upstream)
+              << "Too many header field num=" << req.fs.num_fields() + 1;
         }
         return -1;
       }
@@ -1022,6 +1022,12 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
   auto &resp = downstream->response();
   auto &balloc = downstream->get_block_allocator();
 
+  if (downstream->get_non_final_response() &&
+      !downstream->supports_non_final_response()) {
+    resp.fs.clear_headers();
+    return 0;
+  }
+
 #ifdef HAVE_MRUBY
   if (!downstream->get_non_final_response()) {
     auto worker = handler_->get_worker();
@@ -1059,9 +1065,10 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
         get_client_handler()->get_upstream_scheme());
   }
 
-  http2::build_http1_headers_from_headers(buf, resp.fs.headers());
-
   if (downstream->get_non_final_response()) {
+    http2::build_http1_headers_from_headers(buf, resp.fs.headers(),
+                                            http2::HDOP_STRIP_ALL);
+
     buf->append("\r\n");
 
     if (LOG_ENABLED(INFO)) {
@@ -1072,6 +1079,9 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
 
     return 0;
   }
+
+  http2::build_http1_headers_from_headers(
+      buf, resp.fs.headers(), http2::HDOP_STRIP_ALL & ~http2::HDOP_STRIP_VIA);
 
   auto worker = handler_->get_worker();
 
@@ -1133,6 +1143,24 @@ int HttpsUpstream::on_downstream_header_complete(Downstream *downstream) {
     if (server) {
       buf->append("Server: ");
       buf->append((*server).value);
+      buf->append("\r\n");
+    }
+  }
+
+  if (req.method != HTTP_CONNECT || !downstream->get_upgraded()) {
+    auto affinity_cookie = downstream->get_affinity_cookie_to_send();
+    if (affinity_cookie) {
+      auto dconn = downstream->get_downstream_connection();
+      assert(dconn);
+      auto &group = dconn->get_downstream_addr_group();
+      auto &shared_addr = group->shared_addr;
+      auto &cookieconf = shared_addr->affinity.cookie;
+      auto secure =
+          http::require_cookie_secure_attribute(cookieconf.secure, req.scheme);
+      auto cookie_str = http::create_affinity_cookie(
+          balloc, cookieconf.name, affinity_cookie, cookieconf.path, secure);
+      buf->append("Set-Cookie: ");
+      buf->append(cookie_str);
       buf->append("\r\n");
     }
   }
@@ -1205,7 +1233,8 @@ int HttpsUpstream::on_downstream_body_complete(Downstream *downstream) {
       output->append("0\r\n\r\n");
     } else {
       output->append("0\r\n");
-      http2::build_http1_headers_from_headers(output, trailers);
+      http2::build_http1_headers_from_headers(output, trailers,
+                                              http2::HDOP_STRIP_ALL);
       output->append("\r\n");
     }
   }

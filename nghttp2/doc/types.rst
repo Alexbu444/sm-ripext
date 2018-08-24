@@ -848,11 +848,12 @@ Types (structs, unions and typedefs)
     The parameter and behaviour are similar to
     :type:`nghttp2_on_header_callback`.  The difference is that this
     callback is only invoked when a invalid header name/value pair is
-    received which is silently ignored if this callback is not set.
-    Only invalid regular header field are passed to this callback.  In
-    other words, invalid pseudo header field is not passed to this
-    callback.  Also header fields which includes upper cased latter are
-    also treated as error without passing them to this callback.
+    received which is treated as stream error if this callback is not
+    set.  Only invalid regular header field are passed to this
+    callback.  In other words, invalid pseudo header field is not
+    passed to this callback.  Also header fields which includes upper
+    cased latter are also treated as error without passing them to this
+    callback.
     
     This callback is only considered if HTTP messaging validation is
     turned on (which is on by default, see
@@ -861,10 +862,13 @@ Types (structs, unions and typedefs)
     With this callback, application inspects the incoming invalid
     field, and it also can reset stream from this callback by returning
     :macro:`NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE`.  By default, the
-    error code is :macro:`NGHTTP2_INTERNAL_ERROR`.  To change the error
+    error code is :macro:`NGHTTP2_PROTOCOL_ERROR`.  To change the error
     code, call `nghttp2_submit_rst_stream()` with the error code of
     choice in addition to returning
     :macro:`NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE`.
+    
+    If 0 is returned, the header field is ignored, and the stream is
+    not reset.
 .. type:: typedef int (*nghttp2_on_invalid_header_callback2)( nghttp2_session *session, const nghttp2_frame *frame, nghttp2_rcbuf *name, nghttp2_rcbuf *value, uint8_t flags, void *user_data)
 
     
@@ -1035,6 +1039,31 @@ Types (structs, unions and typedefs)
     debugging purpose.  The *msg* is typically NULL-terminated string
     of length *len*.  *len* does not include the sentinel NULL
     character.
+    
+    This function is deprecated.  The new application should use
+    :type:`nghttp2_error_callback2`.
+    
+    The format of error message may change between nghttp2 library
+    versions.  The application should not depend on the particular
+    format.
+    
+    Normally, application should return 0 from this callback.  If fatal
+    error occurred while doing something in this callback, application
+    should return :macro:`NGHTTP2_ERR_CALLBACK_FAILURE`.  In this case,
+    library will return immediately with return value
+    :macro:`NGHTTP2_ERR_CALLBACK_FAILURE`.  Currently, if nonzero value
+    is returned from this callback, they are treated as
+    :macro:`NGHTTP2_ERR_CALLBACK_FAILURE`, but application should not
+    rely on this details.
+.. type:: typedef int (*nghttp2_error_callback2)(nghttp2_session *session, int lib_error_code, const char *msg, size_t len, void *user_data)
+
+    
+    Callback function invoked when library provides the error code, and
+    message.  This callback is solely for debugging purpose.
+    *lib_error_code* is one of error code defined in
+    :macro:`nghttp2_error`.  The *msg* is typically NULL-terminated
+    string of length *len*, and intended for human consumption.  *len*
+    does not include the sentinel NULL character.
     
     The format of error message may change between nghttp2 library
     versions.  The application should not depend on the particular

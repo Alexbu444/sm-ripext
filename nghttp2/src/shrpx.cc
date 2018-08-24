@@ -573,9 +573,14 @@ void signal_cb(struct ev_loop *loop, ev_signal *w, int revents) {
   case EXEC_BINARY_SIGNAL:
     exec_binary();
     return;
-  case GRACEFUL_SHUTDOWN_SIGNAL:
+  case GRACEFUL_SHUTDOWN_SIGNAL: {
+    auto &listenerconf = get_config()->conn.listener;
+    for (auto &addr : listenerconf.addrs) {
+      close(addr.fd);
+    }
     ipc_send(wp, SHRPX_IPC_GRACEFUL_SHUTDOWN);
     return;
+  }
   case RELOAD_SIGNAL:
     reload_config(wp);
     return;
@@ -1384,15 +1389,12 @@ bool conf_exists(const char *path) {
 } // namespace
 
 namespace {
-constexpr auto DEFAULT_NPN_LIST = StringRef::from_lit("h2,h2-16,h2-14,"
-#ifdef HAVE_SPDYLAY
-                                                      "spdy/3.1,"
-#endif // HAVE_SPDYLAY
-                                                      "http/1.1");
+constexpr auto DEFAULT_NPN_LIST =
+    StringRef::from_lit("h2,h2-16,h2-14,http/1.1");
 } // namespace
 
 namespace {
-constexpr auto DEFAULT_TLS_MIN_PROTO_VERSION = StringRef::from_lit("TLSv1.1");
+constexpr auto DEFAULT_TLS_MIN_PROTO_VERSION = StringRef::from_lit("TLSv1.2");
 #ifdef TLS1_3_VERSION
 constexpr auto DEFAULT_TLS_MAX_PROTO_VERSION = StringRef::from_lit("TLSv1.3");
 #else  // !TLS1_3_VERSION
@@ -1490,13 +1492,11 @@ void fill_default_config(Config *config) {
       timeoutconf.settings = 10_s;
     }
 
-    // window size for HTTP/2 and SPDY upstream connection per stream.
-    // 2**16-1 = 64KiB-1, which is HTTP/2 default.  Please note that
-    // SPDY/3 default is 64KiB.
+    // window size for HTTP/2 upstream connection per stream.  2**16-1
+    // = 64KiB-1, which is HTTP/2 default.
     upstreamconf.window_size = 64_k - 1;
-    // HTTP/2 and SPDY/3.1 has connection-level flow control. The
-    // default window size for HTTP/2 is 64KiB - 1.  SPDY/3's default
-    // is 64KiB
+    // HTTP/2 has connection-level flow control. The default window
+    // size for HTTP/2 is 64KiB - 1.
     upstreamconf.connection_window_size = 64_k - 1;
     upstreamconf.max_concurrent_streams = 100;
 
@@ -1602,7 +1602,7 @@ void fill_default_config(Config *config) {
   }
 
   auto &apiconf = config->api;
-  apiconf.max_request_body = 16_k;
+  apiconf.max_request_body = 32_m;
 
   auto &dnsconf = config->dns;
   {
@@ -1624,7 +1624,7 @@ void print_version(std::ostream &out) {
 namespace {
 void print_usage(std::ostream &out) {
   out << R"(Usage: nghttpx [OPTIONS]... [<PRIVATE_KEY> <CERT>]
-A reverse proxy for HTTP/2, HTTP/1 and SPDY.)"
+A reverse proxy for HTTP/2, and HTTP/1.)"
       << std::endl;
 }
 } // namespace
@@ -1667,7 +1667,7 @@ Connections:
               "/", it  performs exact match against  the request path.
               If  host  is given,  it  performs  a match  against  the
               request host.   For a  request received on  the frontend
-              lister  with "sni-fwd"  parameter enabled,  SNI host  is
+              listener with  "sni-fwd" parameter enabled, SNI  host is
               used instead of a request host.  If host alone is given,
               "/" is  appended to it,  so that it matches  all request
               paths  under the  host  (e.g., specifying  "nghttp2.org"
@@ -1687,6 +1687,18 @@ Connections:
               "www.nghttp2.org"  and  "git.ngttp2.org", but  does  not
               match  against  "nghttp2.org".   The exact  hosts  match
               takes precedence over the wildcard hosts match.
+
+              If path  part ends with  "*", it is treated  as wildcard
+              path.  The  wildcard path  behaves differently  from the
+              normal path.  For normal path,  match is made around the
+              boundary of path component  separator,"/".  On the other
+              hand, the wildcard  path does not take  into account the
+              path component  separator.  All paths which  include the
+              wildcard  path  without  last  "*" as  prefix,  and  are
+              strictly longer than wildcard  path without last "*" are
+              matched.  "*"  must match  at least one  character.  For
+              example,  the   pattern  "/foo*"  matches   "/foo/"  and
+              "/foobar".  But it does not match "/foo", or "/fo".
 
               If <PATTERN> is omitted or  empty string, "/" is used as
               pattern,  which  matches  all request  paths  (catch-all
@@ -1760,16 +1772,32 @@ Connections:
               The     session     affinity    is     enabled     using
               "affinity=<METHOD>"  parameter.   If  "ip" is  given  in
               <METHOD>, client  IP based session affinity  is enabled.
-              If  "none" is  given  in <METHOD>,  session affinity  is
-              disabled, and this is the default.  The session affinity
-              is enabled per  <PATTERN>.  If at least  one backend has
-              "affinity" parameter,  and its  <METHOD> is  not "none",
-              session  affinity is  enabled  for  all backend  servers
-              sharing  the  same  <PATTERN>.   It is  advised  to  set
-              "affinity"  parameter  to   all  backend  explicitly  if
-              session affinity  is desired.  The session  affinity may
-              break if one of the backend gets unreachable, or backend
-              settings are reloaded or replaced by API.
+              If "cookie"  is given in <METHOD>,  cookie based session
+              affinity is  enabled.  If  "none" is given  in <METHOD>,
+              session affinity  is disabled, and this  is the default.
+              The session  affinity is  enabled per <PATTERN>.   If at
+              least  one backend  has  "affinity"  parameter, and  its
+              <METHOD> is not "none",  session affinity is enabled for
+              all backend  servers sharing the same  <PATTERN>.  It is
+              advised  to  set  "affinity" parameter  to  all  backend
+              explicitly if session affinity  is desired.  The session
+              affinity  may   break  if   one  of  the   backend  gets
+              unreachable,  or   backend  settings  are   reloaded  or
+              replaced by API.
+
+              If   "affinity=cookie"    is   used,    the   additional
+              configuration                is                required.
+              "affinity-cookie-name=<NAME>" must be  used to specify a
+              name     of     cookie      to     use.      Optionally,
+              "affinity-cookie-path=<PATH>" can  be used to  specify a
+              path   which   cookie    is   applied.    The   optional
+              "affinity-cookie-secure=<SECURE>"  controls  the  Secure
+              attribute of a cookie.  The default value is "auto", and
+              the Secure attribute is  determined by a request scheme.
+              If a request scheme is "https", then Secure attribute is
+              set.  Otherwise, it  is not set.  If  <SECURE> is "yes",
+              the  Secure attribute  is  always set.   If <SECURE>  is
+              "no", the Secure attribute is always omitted.
 
               By default, name resolution of backend host name is done
               at  start  up,  or reloading  configuration.   If  "dns"
@@ -1791,6 +1819,13 @@ Connections:
               the   same   <PATTERN>.    It    is   advised   to   set
               "redirect-if-no-tls"    parameter   to    all   backends
               explicitly if this feature is desired.
+
+              If "upgrade-scheme"  parameter is used along  with "tls"
+              parameter, HTTP/2 :scheme pseudo header field is changed
+              to "https" from "http" when forwarding a request to this
+              particular backend.  This is  a workaround for a backend
+              server  which  requires  "https" :scheme  pseudo  header
+              field on TLS encrypted connection.
 
               Since ";" and ":" are  used as delimiter, <PATTERN> must
               not  contain these  characters.  Since  ";" has  special
@@ -1862,8 +1897,7 @@ Connections:
 Performance:
   -n, --workers=<N>
               Set the number of worker threads.
-              Default: )"
-      << config->num_worker << R"(
+              Default: )" << config->num_worker << R"(
   --single-thread
               Run everything in one  thread inside the worker process.
               This   feature   is   provided  for   better   debugging
@@ -1963,8 +1997,7 @@ Performance:
 
 Timeout:
   --frontend-http2-read-timeout=<DURATION>
-              Specify  read  timeout  for  HTTP/2  and  SPDY  frontend
-              connection.
+              Specify read timeout for HTTP/2 frontend connection.
               Default: )"
       << util::duration_str(config->conn.upstream.timeout.http2_read) << R"(
   --frontend-read-timeout=<DURATION>
@@ -1981,13 +2014,13 @@ Timeout:
               Default: )"
       << util::duration_str(config->conn.upstream.timeout.idle_read) << R"(
   --stream-read-timeout=<DURATION>
-              Specify  read timeout  for HTTP/2  and SPDY  streams.  0
-              means no timeout.
+              Specify  read timeout  for HTTP/2  streams.  0  means no
+              timeout.
               Default: )"
       << util::duration_str(config->http2.timeout.stream_read) << R"(
   --stream-write-timeout=<DURATION>
-              Specify write  timeout for  HTTP/2 and SPDY  streams.  0
-              means no timeout.
+              Specify write  timeout for  HTTP/2 streams.  0  means no
+              timeout.
               Default: )"
       << util::duration_str(config->http2.timeout.stream_write) << R"(
   --backend-read-timeout=<DURATION>
@@ -2045,8 +2078,7 @@ SSL/TLS:
   --client-ciphers=<SUITE>
               Set  allowed cipher  list for  backend connection.   The
               format of the string is described in OpenSSL ciphers(1).
-              Default: )"
-      << config->tls.client.ciphers << R"(
+              Default: )" << config->tls.client.ciphers << R"(
   --ecdh-curves=<LIST>
               Set  supported  curve  list  for  frontend  connections.
               <LIST> is a  colon separated list of curve  NID or names
@@ -2059,11 +2091,14 @@ SSL/TLS:
               Don't  verify backend  server's  certificate  if TLS  is
               enabled for backend connections.
   --cacert=<PATH>
-              Set path to trusted CA  certificate file used in backend
-              TLS connections.   The file must  be in PEM  format.  It
-              can  contain  multiple   certificates.   If  the  linked
-              OpenSSL is configured to  load system wide certificates,
-              they are loaded at startup regardless of this option.
+              Set path to trusted CA  certificate file.  It is used in
+              backend  TLS connections  to verify  peer's certificate.
+              It is also used to  verify OCSP response from the script
+              set by --fetch-ocsp-response-file.  The  file must be in
+              PEM format.   It can contain multiple  certificates.  If
+              the  linked OpenSSL  is configured  to load  system wide
+              certificates, they  are loaded at startup  regardless of
+              this option.
   --private-key-passwd-file=<PATH>
               Path  to file  that contains  password for  the server's
               private key.   If none is  given and the private  key is
@@ -2072,12 +2107,12 @@ SSL/TLS:
               Specify  additional certificate  and  private key  file.
               nghttpx will  choose certificates based on  the hostname
               indicated by client using TLS SNI extension.  If nghttpx
-              is  built with  OpenSSL >=  1.0.2, signature  algorithms
-              (e.g., ECDSA+SHA256, RSA+SHA256) presented by client are
-              also taken  into consideration.  This allows  nghttpx to
-              send ECDSA certificate to  modern clients, while sending
-              RSA based certificate to older clients.  This option can
-              be  used multiple  times.  To  make OCSP  stapling work,
+              is  built with  OpenSSL  >= 1.0.2,  the shared  elliptic
+              curves (e.g., P-256) between  client and server are also
+              taken into  consideration.  This allows nghttpx  to send
+              ECDSA certificate  to modern clients, while  sending RSA
+              based certificate to older  clients.  This option can be
+              used  multiple  times.   To  make  OCSP  stapling  work,
               <CERTPATH> must be absolute path.
 
               Additional parameter  can be specified in  <PARAM>.  The
@@ -2099,14 +2134,19 @@ SSL/TLS:
               NPN.  The parameter must be  delimited by a single comma
               only  and any  white spaces  are  treated as  a part  of
               protocol string.
-              Default: )"
-      << DEFAULT_NPN_LIST << R"(
+              Default: )" << DEFAULT_NPN_LIST
+      << R"(
   --verify-client
               Require and verify client certificate.
   --verify-client-cacert=<PATH>
               Path  to file  that contains  CA certificates  to verify
               client certificate.  The file must be in PEM format.  It
               can contain multiple certificates.
+  --verify-client-tolerate-expired
+              Accept  expired  client  certificate.   Operator  should
+              handle  the expired  client  certificate  by some  means
+              (e.g.,  mruby  script).   Otherwise, this  option  might
+              cause a security risk.
   --client-private-key-file=<PATH>
               Path to  file that contains  client private key  used in
               backend client authentication.
@@ -2119,15 +2159,20 @@ SSL/TLS:
               --tls-min-proto-version and  --tls-max-proto-version are
               enabled.  If the protocol list advertised by client does
               not  overlap  this range,  you  will  receive the  error
-              message "unknown protocol".  The available versions are:
+              message "unknown protocol".  If a protocol version lower
+              than TLSv1.2 is specified, make sure that the compatible
+              ciphers are  included in --ciphers option.   The default
+              cipher  list  only   includes  ciphers  compatible  with
+              TLSv1.2 or above.  The available versions are:
               )"
 #ifdef TLS1_3_VERSION
-                             "TLSv1.3, "
+         "TLSv1.3, "
 #endif // TLS1_3_VERSION
-                             "TLSv1.2, TLSv1.1, and TLSv1.0"
-                             R"(
+         "TLSv1.2, TLSv1.1, and TLSv1.0"
+         R"(
               Default: )"
-      << DEFAULT_TLS_MIN_PROTO_VERSION << R"(
+      << DEFAULT_TLS_MIN_PROTO_VERSION
+      << R"(
   --tls-max-proto-version=<VER>
               Specify maximum SSL/TLS protocol.   The name matching is
               done in  case-insensitive manner.  The  versions between
@@ -2137,10 +2182,10 @@ SSL/TLS:
               message "unknown protocol".  The available versions are:
               )"
 #ifdef TLS1_3_VERSION
-                                          "TLSv1.3, "
+         "TLSv1.3, "
 #endif // TLS1_3_VERSION
-                                          "TLSv1.2, TLSv1.1, and TLSv1.0"
-                                          R"(
+         "TLSv1.2, TLSv1.1, and TLSv1.0"
+         R"(
               Default: )"
       << DEFAULT_TLS_MAX_PROTO_VERSION << R"(
   --tls-ticket-key-file=<PATH>
@@ -2222,6 +2267,14 @@ SSL/TLS:
               Set interval to update OCSP response cache.
               Default: )"
       << util::duration_str(config->tls.ocsp.update_interval) << R"(
+  --ocsp-startup
+              Start  accepting connections  after initial  attempts to
+              get OCSP responses  finish.  It does not  matter some of
+              the  attempts  fail.  This  feature  is  useful if  OCSP
+              responses   must    be   available    before   accepting
+              connections.
+  --no-verify-ocsp
+              nghttpx does not verify OCSP response.
   --no-ocsp   Disable OCSP stapling.
   --tls-session-cache-memcached=<HOST>,<PORT>[;tls]
               Specify  address of  memcached server  to store  session
@@ -2309,11 +2362,11 @@ SSL/TLS:
               consider   to  use   --client-no-http2-cipher-black-list
               option.  But be aware its implications.
 
-HTTP/2 and SPDY:
+HTTP/2:
   -c, --frontend-http2-max-concurrent-streams=<N>
               Set the maximum number of  the concurrent streams in one
-              frontend HTTP/2 and SPDY session.
-              Default:  )"
+              frontend HTTP/2 session.
+              Default: )"
       << config->http2.upstream.max_concurrent_streams << R"(
   --backend-http2-max-concurrent-streams=<N>
               Set the maximum number of  the concurrent streams in one
@@ -2323,14 +2376,13 @@ HTTP/2 and SPDY:
               Default: )"
       << config->http2.downstream.max_concurrent_streams << R"(
   --frontend-http2-window-size=<SIZE>
-              Sets the  per-stream initial  window size of  HTTP/2 and
-              SPDY frontend connection.
+              Sets  the  per-stream  initial  window  size  of  HTTP/2
+              frontend connection.
               Default: )"
       << config->http2.upstream.window_size << R"(
   --frontend-http2-connection-window-size=<SIZE>
-              Sets the  per-connection window size of  HTTP/2 and SPDY
-              frontend  connection.  For  SPDY  connection, the  value
-              less than 64KiB is rounded up to 64KiB.
+              Sets the  per-connection window size of  HTTP/2 frontend
+              connection.
               Default: )"
       << config->http2.upstream.connection_window_size << R"(
   --backend-http2-window-size=<SIZE>
@@ -2356,8 +2408,7 @@ HTTP/2 and SPDY:
               It is  also supported if  both frontend and  backend are
               HTTP/2 in default mode.  In  this case, server push from
               backend session is relayed  to frontend, and server push
-              via Link header field  is also supported.  SPDY frontend
-              does not support server push.
+              via Link header field is also supported.
   --frontend-http2-optimize-write-buffer-size
               (Experimental) Enable write  buffer size optimization in
               frontend HTTP/2 TLS  connection.  This optimization aims
@@ -2412,7 +2463,7 @@ HTTP/2 and SPDY:
 
 Mode:
   (default mode)
-              Accept HTTP/2, SPDY and HTTP/1.1 over SSL/TLS.  "no-tls"
+              Accept  HTTP/2,  and  HTTP/1.1 over  SSL/TLS.   "no-tls"
               parameter is  used in  --frontend option,  accept HTTP/2
               and HTTP/1.1 over cleartext  TCP.  The incoming HTTP/1.1
               connection  can  be  upgraded  to  HTTP/2  through  HTTP
@@ -2455,6 +2506,16 @@ Logging:
                 the response.   For HTTP/1,  ALPN is  always http/1.1,
                 regardless of minor version.
               * $tls_cipher: cipher used for SSL/TLS connection.
+              * $tls_client_fingerprint_sha256: SHA-256 fingerprint of
+                client certificate.
+              * $tls_client_fingerprint_sha1:  SHA-1   fingerprint  of
+                client certificate.
+              * $tls_client_subject_name:   subject  name   in  client
+                certificate.
+              * $tls_client_issuer_name:   issuer   name   in   client
+                certificate.
+              * $tls_client_serial:    serial    number   in    client
+                certificate.
               * $tls_protocol: protocol for SSL/TLS connection.
               * $tls_session_id: session ID for SSL/TLS connection.
               * $tls_session_reused:  "r"   if  SSL/TLS   session  was
@@ -2478,8 +2539,7 @@ Logging:
               Set path to write error  log.  To reopen file, send USR1
               signal  to nghttpx.   stderr will  be redirected  to the
               error log file unless --errorlog-syslog is used.
-              Default: )"
-      << config->logging.error.file << R"(
+              Default: )" << config->logging.error.file << R"(
   --errorlog-syslog
               Send  error log  to  syslog.  If  this  option is  used,
               --errorlog-file option is ignored.
@@ -2611,8 +2671,8 @@ HTTP:
               Specify the port number which appears in Location header
               field  when  redirect  to  HTTPS  URI  is  made  due  to
               "redirect-if-not-tls" parameter in --backend option.
-              Default: )"
-      << config->http.redirect_https_port << R"(
+              Default: )" << config->http.redirect_https_port
+      << R"(
 
 API:
   --api-max-request-body=<SIZE>
@@ -2691,8 +2751,7 @@ Misc:
               Load  configuration  from   <PATH>.   Please  note  that
               nghttpx always  tries to read the  default configuration
               file if --conf is not given.
-              Default: )"
-      << config->conf_path << R"(
+              Default: )" << config->conf_path << R"(
   --include=<PATH>
               Load additional configurations from <PATH>.  File <PATH>
               is  read  when  configuration  parser  encountered  this
@@ -2710,8 +2769,7 @@ Misc:
   The <DURATION> argument is an integer and an optional unit (e.g., 1s
   is 1 second and 500ms is 500 milliseconds).  Units are h, m, s or ms
   (hours, minutes, seconds and milliseconds, respectively).  If a unit
-  is omitted, a second is used as unit.)"
-      << std::endl;
+  is omitted, a second is used as unit.)" << std::endl;
 }
 } // namespace
 
@@ -2719,10 +2777,12 @@ namespace {
 int process_options(Config *config,
                     std::vector<std::pair<StringRef, StringRef>> &cmdcfgs) {
   std::array<char, STRERROR_BUFSIZE> errbuf;
+  std::map<StringRef, size_t> pattern_addr_indexer;
   if (conf_exists(config->conf_path.c_str())) {
     LOG(NOTICE) << "Loading configuration from " << config->conf_path;
     std::set<StringRef> include_set;
-    if (load_config(config, config->conf_path.c_str(), include_set) == -1) {
+    if (load_config(config, config->conf_path.c_str(), include_set,
+                    pattern_addr_indexer) == -1) {
       LOG(FATAL) << "Failed to load configuration from " << config->conf_path;
       return -1;
     }
@@ -2736,7 +2796,8 @@ int process_options(Config *config,
     std::set<StringRef> include_set;
 
     for (auto &p : cmdcfgs) {
-      if (parse_config(config, p.first, p.second, include_set) == -1) {
+      if (parse_config(config, p.first, p.second, include_set,
+                       pattern_addr_indexer) == -1) {
         LOG(FATAL) << "Failed to parse command-line argument.";
         return -1;
       }
@@ -3171,7 +3232,9 @@ int main(int argc, char **argv) {
         {SHRPX_OPT_BACKEND_HTTP_PROXY_URI.c_str(), required_argument, &flag,
          26},
         {SHRPX_OPT_BACKEND_NO_TLS.c_str(), no_argument, &flag, 27},
+        {SHRPX_OPT_OCSP_STARTUP.c_str(), no_argument, &flag, 28},
         {SHRPX_OPT_FRONTEND_NO_TLS.c_str(), no_argument, &flag, 29},
+        {SHRPX_OPT_NO_VERIFY_OCSP.c_str(), no_argument, &flag, 30},
         {SHRPX_OPT_BACKEND_TLS_SNI_FIELD.c_str(), required_argument, &flag, 31},
         {SHRPX_OPT_DH_PARAM_FILE.c_str(), required_argument, &flag, 33},
         {SHRPX_OPT_READ_RATE.c_str(), required_argument, &flag, 34},
@@ -3353,6 +3416,8 @@ int main(int argc, char **argv) {
         {SHRPX_OPT_NO_STRIP_INCOMING_X_FORWARDED_PROTO.c_str(), no_argument,
          &flag, 158},
         {SHRPX_OPT_SINGLE_PROCESS.c_str(), no_argument, &flag, 159},
+        {SHRPX_OPT_VERIFY_CLIENT_TOLERATE_EXPIRED.c_str(), no_argument, &flag,
+         160},
         {nullptr, 0, nullptr, 0}};
 
     int option_index = 0;
@@ -3521,9 +3586,19 @@ int main(int argc, char **argv) {
         cmdcfgs.emplace_back(SHRPX_OPT_BACKEND_NO_TLS,
                              StringRef::from_lit("yes"));
         break;
+      case 28:
+        // --ocsp-startup
+        cmdcfgs.emplace_back(SHRPX_OPT_OCSP_STARTUP,
+                             StringRef::from_lit("yes"));
+        break;
       case 29:
         // --frontend-no-tls
         cmdcfgs.emplace_back(SHRPX_OPT_FRONTEND_NO_TLS,
+                             StringRef::from_lit("yes"));
+        break;
+      case 30:
+        // --no-verify-ocsp
+        cmdcfgs.emplace_back(SHRPX_OPT_NO_VERIFY_OCSP,
                              StringRef::from_lit("yes"));
         break;
       case 31:
@@ -4102,6 +4177,11 @@ int main(int argc, char **argv) {
       case 159:
         // --single-process
         cmdcfgs.emplace_back(SHRPX_OPT_SINGLE_PROCESS,
+                             StringRef::from_lit("yes"));
+        break;
+      case 160:
+        // --verify-client-tolerate-expired
+        cmdcfgs.emplace_back(SHRPX_OPT_VERIFY_CLIENT_TOLERATE_EXPIRED,
                              StringRef::from_lit("yes"));
         break;
       default:

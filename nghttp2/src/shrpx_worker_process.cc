@@ -67,7 +67,7 @@ void drop_privileges(
 #ifdef HAVE_NEVERBLEED
     neverbleed_t *nb
 #endif // HAVE_NEVERBLEED
-    ) {
+) {
   std::array<char, STRERROR_BUFSIZE> errbuf;
   auto config = get_config();
 
@@ -114,12 +114,10 @@ void graceful_shutdown(ConnectionHandler *conn_handler) {
 
   conn_handler->set_graceful_shutdown(true);
 
-  conn_handler->disable_acceptor();
-
-  // After disabling accepting new connection, disptach incoming
-  // connection in backlog.
-
+  // TODO What happens for the connections not established in the
+  // kernel?
   conn_handler->accept_pending_connection();
+  conn_handler->delete_acceptor();
 
   conn_handler->graceful_shutdown_worker();
 
@@ -539,7 +537,7 @@ int worker_process_event_loop(WorkerProcessConfig *wpconf) {
 #ifdef HAVE_NEVERBLEED
       nb
 #endif // HAVE_NEVERBLEED
-      );
+  );
 
   ev_io ipcev;
   ev_io_init(&ipcev, ipc_readcb, wpconf->ipc_fd, EV_READ);
@@ -547,6 +545,11 @@ int worker_process_event_loop(WorkerProcessConfig *wpconf) {
   ev_io_start(loop, &ipcev);
 
   if (tls::upstream_tls_enabled(config->conn) && !config->tls.ocsp.disabled) {
+    if (config->tls.ocsp.startup) {
+      conn_handler.set_enable_acceptor_on_ocsp_completion(true);
+      conn_handler.disable_acceptor();
+    }
+
     conn_handler.proceed_next_cert_ocsp();
   }
 

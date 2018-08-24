@@ -201,9 +201,7 @@ ssize_t http2_data_read_callback(nghttp2_session *session, int32_t stream_id,
     if (!trailers.empty()) {
       std::vector<nghttp2_nv> nva;
       nva.reserve(trailers.size());
-      // We cannot use nocopy version, since nva may be touched after
-      // Downstream object is deleted.
-      http2::copy_headers_to_nva(nva, trailers);
+      http2::copy_headers_to_nva_nocopy(nva, trailers, http2::HDOP_STRIP_ALL);
       if (!nva.empty()) {
         rv = nghttp2_submit_trailer(session, stream_id, nva.data(), nva.size());
         if (rv != 0) {
@@ -293,7 +291,14 @@ int Http2DownstreamConnection::push_request_headers() {
   if (req.method != HTTP_CONNECT) {
     assert(!req.scheme.empty());
 
-    nva.push_back(http2::make_nv_ls_nocopy(":scheme", req.scheme));
+    auto addr = http2session_->get_addr();
+    assert(addr);
+    // We will handle more protocol scheme upgrade in the future.
+    if (addr->tls && addr->upgrade_scheme && req.scheme == "http") {
+      nva.push_back(http2::make_nv_ll(":scheme", "https"));
+    } else {
+      nva.push_back(http2::make_nv_ls_nocopy(":scheme", req.scheme));
+    }
 
     if (req.method == HTTP_OPTIONS && req.path.empty()) {
       nva.push_back(http2::make_nv_ll(":path", "*"));
@@ -310,7 +315,16 @@ int Http2DownstreamConnection::push_request_headers() {
     nva.push_back(http2::make_nv_ls_nocopy(":authority", authority));
   }
 
-  http2::copy_headers_to_nva_nocopy(nva, req.fs.headers());
+  auto &fwdconf = httpconf.forwarded;
+  auto &xffconf = httpconf.xff;
+  auto &xfpconf = httpconf.xfp;
+
+  uint32_t build_flags =
+      (fwdconf.strip_incoming ? http2::HDOP_STRIP_FORWARDED : 0) |
+      (xffconf.strip_incoming ? http2::HDOP_STRIP_X_FORWARDED_FOR : 0) |
+      (xfpconf.strip_incoming ? http2::HDOP_STRIP_X_FORWARDED_PROTO : 0);
+
+  http2::copy_headers_to_nva_nocopy(nva, req.fs.headers(), build_flags);
 
   if (!http2conf.no_cookie_crumbling) {
     downstream_->crumble_request_cookie(nva);
@@ -318,8 +332,6 @@ int Http2DownstreamConnection::push_request_headers() {
 
   auto upstream = downstream_->get_upstream();
   auto handler = upstream->get_client_handler();
-
-  auto &fwdconf = httpconf.forwarded;
 
   auto fwd =
       fwdconf.strip_incoming ? nullptr : req.fs.header(http2::HD_FORWARDED);
@@ -351,8 +363,6 @@ int Http2DownstreamConnection::push_request_headers() {
     nva.push_back(http2::make_nv_ls_nocopy("forwarded", fwd->value));
   }
 
-  auto &xffconf = httpconf.xff;
-
   auto xff = xffconf.strip_incoming ? nullptr
                                     : req.fs.header(http2::HD_X_FORWARDED_FOR);
 
@@ -371,7 +381,6 @@ int Http2DownstreamConnection::push_request_headers() {
   }
 
   if (!config->http2_proxy && req.method != HTTP_CONNECT) {
-    auto &xfpconf = httpconf.xfp;
     auto xfp = xfpconf.strip_incoming
                    ? nullptr
                    : req.fs.header(http2::HD_X_FORWARDED_PROTO);

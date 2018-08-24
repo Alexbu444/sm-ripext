@@ -45,12 +45,11 @@
 #include <openssl/x509v3.h>
 #include <openssl/rand.h>
 #include <openssl/dh.h>
+#ifndef OPENSSL_NO_OCSP
+#include <openssl/ocsp.h>
+#endif // OPENSSL_NO_OCSP
 
 #include <nghttp2/nghttp2.h>
-
-#ifdef HAVE_SPDYLAY
-#include <spdylay/spdylay.h>
-#endif // HAVE_SPDYLAY
 
 #include "shrpx_log.h"
 #include "shrpx_client_handler.h"
@@ -65,6 +64,7 @@
 #include "tls.h"
 #include "template.h"
 #include "ssl_compat.h"
+#include "timegm.h"
 
 using namespace nghttp2;
 
@@ -80,6 +80,7 @@ const unsigned char *ASN1_STRING_get0_data(ASN1_STRING *x) {
 } // namespace
 #endif // !OPENSSL_1_1_API
 
+#ifndef OPENSSL_NO_NEXTPROTONEG
 namespace {
 int next_proto_cb(SSL *s, const unsigned char **data, unsigned int *len,
                   void *arg) {
@@ -89,12 +90,19 @@ int next_proto_cb(SSL *s, const unsigned char **data, unsigned int *len,
   return SSL_TLSEXT_ERR_OK;
 }
 } // namespace
+#endif // !OPENSSL_NO_NEXTPROTONEG
 
 namespace {
 int verify_callback(int preverify_ok, X509_STORE_CTX *ctx) {
   if (!preverify_ok) {
     int err = X509_STORE_CTX_get_error(ctx);
     int depth = X509_STORE_CTX_get_error_depth(ctx);
+    if (err == X509_V_ERR_CERT_HAS_EXPIRED && depth == 0 &&
+        get_config()->tls.client_verify.tolerate_expired) {
+      LOG(INFO) << "The client certificate has expired, but is accepted by "
+                   "configuration";
+      return 1;
+    }
     LOG(ERROR) << "client certificate verify error:num=" << err << ":"
                << X509_verify_cert_error_string(err) << ":depth=" << depth;
   }
@@ -146,6 +154,8 @@ int ssl_pem_passwd_cb(char *buf, int size, int rwflag, void *user_data) {
 } // namespace
 
 namespace {
+// *al is set to SSL_AD_UNRECOGNIZED_NAME by openssl, so we don't have
+// to set it explicitly.
 int servername_callback(SSL *ssl, int *al, void *arg) {
   auto conn = static_cast<Connection *>(SSL_get_app_data(ssl));
   auto handler = static_cast<ClientHandler *>(conn->data);
@@ -153,13 +163,13 @@ int servername_callback(SSL *ssl, int *al, void *arg) {
 
   auto rawhost = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
   if (rawhost == nullptr) {
-    return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_NOACK;
   }
 
   auto len = strlen(rawhost);
   // NI_MAXHOST includes terminal NULL.
   if (len == 0 || len + 1 > NI_MAXHOST) {
-    return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_NOACK;
   }
 
   std::array<uint8_t, NI_MAXHOST> buf;
@@ -170,44 +180,65 @@ int servername_callback(SSL *ssl, int *al, void *arg) {
 
   auto hostname = StringRef{std::begin(buf), end_buf};
 
-  handler->set_tls_sni(hostname);
-
   auto cert_tree = worker->get_cert_lookup_tree();
-  if (!cert_tree) {
-    return SSL_TLSEXT_ERR_OK;
-  }
 
   auto idx = cert_tree->lookup(hostname);
   if (idx == -1) {
-    return SSL_TLSEXT_ERR_OK;
+    return SSL_TLSEXT_ERR_NOACK;
   }
+
+  handler->set_tls_sni(hostname);
 
   auto conn_handler = worker->get_connection_handler();
 
   const auto &ssl_ctx_list = conn_handler->get_indexed_ssl_ctx(idx);
   assert(!ssl_ctx_list.empty());
 
-#if !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER) &&     \
+#if !defined(OPENSSL_IS_BORINGSSL) && !LIBRESSL_IN_USE &&                      \
     OPENSSL_VERSION_NUMBER >= 0x10002000L
-  // boringssl removed SSL_get_sigalgs.
-  auto num_sigalg =
-      SSL_get_sigalgs(ssl, 0, nullptr, nullptr, nullptr, nullptr, nullptr);
+  auto num_shared_curves = SSL_get_shared_curve(ssl, -1);
 
-  for (auto i = 0; i < num_sigalg; ++i) {
-    int sigalg;
-    SSL_get_sigalgs(ssl, i, nullptr, nullptr, &sigalg, nullptr, nullptr);
+  for (auto i = 0; i < num_shared_curves; ++i) {
+    auto shared_curve = SSL_get_shared_curve(ssl, i);
+
     for (auto ssl_ctx : ssl_ctx_list) {
       auto cert = SSL_CTX_get0_certificate(ssl_ctx);
-      // X509_get_signature_nid is available since OpenSSL 1.0.2.
-      auto cert_sigalg = X509_get_signature_nid(cert);
 
-      if (sigalg == cert_sigalg) {
+#if OPENSSL_1_1_API
+      auto pubkey = X509_get0_pubkey(cert);
+#else  // !OPENSSL_1_1_API
+      auto pubkey = X509_get_pubkey(cert);
+#endif // !OPENSSL_1_1_API
+
+      if (EVP_PKEY_base_id(pubkey) != EVP_PKEY_EC) {
+        continue;
+      }
+
+#if OPENSSL_1_1_API
+      auto eckey = EVP_PKEY_get0_EC_KEY(pubkey);
+#else  // !OPENSSL_1_1_API
+      auto eckey = EVP_PKEY_get1_EC_KEY(pubkey);
+#endif // !OPENSSL_1_1_API
+
+      if (eckey == nullptr) {
+        continue;
+      }
+
+      auto ecgroup = EC_KEY_get0_group(eckey);
+      auto cert_curve = EC_GROUP_get_curve_name(ecgroup);
+
+#if !OPENSSL_1_1_API
+      EC_KEY_free(eckey);
+      EVP_PKEY_free(pubkey);
+#endif // !OPENSSL_1_1_API
+
+      if (shared_curve == cert_curve) {
         SSL_set_SSL_CTX(ssl, ssl_ctx);
         return SSL_TLSEXT_ERR_OK;
       }
     }
   }
-#endif // !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER) &&
+#endif // !defined(OPENSSL_IS_BORINGSSL) && !LIBRESSL_IN_USE &&
        // OPENSSL_VERSION_NUMBER >= 0x10002000L
 
   SSL_set_SSL_CTX(ssl, ssl_ctx_list[0]);
@@ -534,6 +565,8 @@ int alpn_select_proto_cb(SSL *ssl, const unsigned char **out,
 } // namespace
 #endif // OPENSSL_VERSION_NUMBER >= 0x10002000L
 
+#if !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
+
 #ifndef TLSEXT_TYPE_signed_certificate_timestamp
 #define TLSEXT_TYPE_signed_certificate_timestamp 18
 #endif // !TLSEXT_TYPE_signed_certificate_timestamp
@@ -596,8 +629,7 @@ int sct_parse_cb(SSL *ssl, unsigned int ext_type, unsigned int context,
 }
 } // namespace
 
-#if !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L &&               \
-    !OPENSSL_1_1_1_API
+#if !OPENSSL_1_1_1_API
 
 namespace {
 int legacy_sct_add_cb(SSL *ssl, unsigned int ext_type,
@@ -622,10 +654,10 @@ int legacy_sct_parse_cb(SSL *ssl, unsigned int ext_type,
 }
 } // namespace
 
-#endif // !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L &&
-       // !OPENSSL_1_1_1_API
+#endif // !OPENSSL_1_1_1_API
+#endif // !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
 
-#if !LIBRESSL_IN_USE
+#ifndef OPENSSL_NO_PSK
 namespace {
 unsigned int psk_server_cb(SSL *ssl, const char *identity, unsigned char *psk,
                            unsigned int max_psk_len) {
@@ -649,9 +681,9 @@ unsigned int psk_server_cb(SSL *ssl, const char *identity, unsigned char *psk,
   return static_cast<unsigned int>(secret.size());
 }
 } // namespace
-#endif // !LIBRESSL_IN_USE
+#endif // !OPENSSL_NO_PSK
 
-#if !LIBRESSL_IN_USE
+#ifndef OPENSSL_NO_PSK
 namespace {
 unsigned int psk_client_cb(SSL *ssl, const char *hint, char *identity_out,
                            unsigned int max_identity_len, unsigned char *psk,
@@ -684,7 +716,7 @@ unsigned int psk_client_cb(SSL *ssl, const char *hint, char *identity_out,
   return static_cast<unsigned int>(secret.size());
 }
 } // namespace
-#endif // !LIBRESSL_IN_USE
+#endif // !OPENSSL_NO_PSK
 
 struct TLSProtocol {
   StringRef name;
@@ -720,7 +752,7 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
                             ,
                             neverbleed_t *nb
 #endif // HAVE_NEVERBLEED
-                            ) {
+) {
   auto ssl_ctx = SSL_CTX_new(SSLv23_server_method());
   if (!ssl_ctx) {
     LOG(FATAL) << ERR_error_string(ERR_get_error(), nullptr);
@@ -762,7 +794,7 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
   }
 
 #ifndef OPENSSL_NO_EC
-#if !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
+#if !LIBRESSL_LEGACY_API && OPENSSL_VERSION_NUMBER >= 0x10002000L
   if (SSL_CTX_set1_curves_list(ssl_ctx, tlsconf.ecdh_curves.c_str()) != 1) {
     LOG(FATAL) << "SSL_CTX_set1_curves_list " << tlsconf.ecdh_curves
                << " failed";
@@ -773,7 +805,7 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
   // function was deprecated in OpenSSL 1.1.0 and BoringSSL.
   SSL_CTX_set_ecdh_auto(ssl_ctx, 1);
 #endif // !defined(OPENSSL_IS_BORINGSSL) && !OPENSSL_1_1_API
-#else  // LIBRESSL_IN_USE || OPENSSL_VERSION_NUBMER < 0x10002000L
+#else  // LIBRESSL_LEGACY_API || OPENSSL_VERSION_NUBMER < 0x10002000L
   // Use P-256, which is sufficiently secure at the time of this
   // writing.
   auto ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
@@ -784,7 +816,7 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
   }
   SSL_CTX_set_tmp_ecdh(ssl_ctx, ecdh);
   EC_KEY_free(ecdh);
-#endif // LIBRESSL_IN_USE || OPENSSL_VERSION_NUBMER < 0x10002000L
+#endif // LIBRESSL_LEGACY_API || OPENSSL_VERSION_NUBMER < 0x10002000L
 #endif // OPENSSL_NO_EC
 
   if (!tlsconf.dh_param_file.empty()) {
@@ -807,6 +839,22 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
   }
 
   SSL_CTX_set_mode(ssl_ctx, SSL_MODE_RELEASE_BUFFERS);
+
+  if (SSL_CTX_set_default_verify_paths(ssl_ctx) != 1) {
+    LOG(WARN) << "Could not load system trusted ca certificates: "
+              << ERR_error_string(ERR_get_error(), nullptr);
+  }
+
+  if (!tlsconf.cacert.empty()) {
+    if (SSL_CTX_load_verify_locations(ssl_ctx, tlsconf.cacert.c_str(),
+                                      nullptr) != 1) {
+      LOG(FATAL) << "Could not load trusted ca certificates from "
+                 << tlsconf.cacert << ": "
+                 << ERR_error_string(ERR_get_error(), nullptr);
+      DIE();
+    }
+  }
+
   if (!tlsconf.private_key_passwd.empty()) {
     SSL_CTX_set_default_passwd_cb(ssl_ctx, ssl_pem_passwd_cb);
     SSL_CTX_set_default_passwd_cb_userdata(ssl_ctx, config);
@@ -860,8 +908,9 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
       }
       SSL_CTX_set_client_CA_list(ssl_ctx, list);
     }
-    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE |
-                                    SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+    SSL_CTX_set_verify(ssl_ctx,
+                       SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE |
+                           SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                        verify_callback);
   }
   SSL_CTX_set_tlsext_servername_callback(ssl_ctx, servername_callback);
@@ -876,7 +925,9 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
 #endif // OPENSSL_IS_BORINGSSL
 
   // NPN advertisement
+#ifndef OPENSSL_NO_NEXTPROTONEG
   SSL_CTX_set_next_protos_advertised_cb(ssl_ctx, next_proto_cb, nullptr);
+#endif // !OPENSSL_NO_NEXTPROTONEG
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
   // ALPN selection callback
   SSL_CTX_set_alpn_select_cb(ssl_ctx, alpn_select_proto_cb, nullptr);
@@ -915,9 +966,9 @@ SSL_CTX *create_ssl_context(const char *private_key_file, const char *cert_file,
   }
 #endif // !LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L
 
-#if !LIBRESSL_IN_USE
+#ifndef OPENSSL_NO_PSK
   SSL_CTX_set_psk_server_callback(ssl_ctx, psk_server_cb);
-#endif // !LIBRESSL_IN_USE
+#endif // !LIBRESSL_NO_PSK
 
   auto tls_ctx_data = new TLSContextData();
   tls_ctx_data->cert_file = cert_file;
@@ -1065,13 +1116,15 @@ SSL_CTX *create_ssl_client_context(
 #endif // HAVE_NEVERBLEED
   }
 
-#if !LIBRESSL_IN_USE
+#ifndef OPENSSL_NO_PSK
   SSL_CTX_set_psk_client_callback(ssl_ctx, psk_client_cb);
-#endif // !LIBRESSL_IN_USE
+#endif // !OPENSSL_NO_PSK
 
   // NPN selection callback.  This is required to set SSL_CTX because
   // OpenSSL does not offer SSL_set_next_proto_select_cb.
+#ifndef OPENSSL_NO_NEXTPROTONEG
   SSL_CTX_set_next_proto_select_cb(ssl_ctx, next_proto_select_cb, nullptr);
+#endif // !OPENSSL_NO_NEXTPROTONEG
 
   return ssl_ctx;
 }
@@ -1502,18 +1555,15 @@ int cert_lookup_tree_add_ssl_ctx(
     SSL_CTX *ssl_ctx) {
   std::array<uint8_t, NI_MAXHOST> buf;
 
-#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x10002000L
+#if LIBRESSL_2_7_API ||                                                        \
+    (!LIBRESSL_IN_USE && OPENSSL_VERSION_NUMBER >= 0x10002000L)
   auto cert = SSL_CTX_get0_certificate(ssl_ctx);
-#else  // defined(LIBRESSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER <
-  // 0x10002000L
+#else  // !LIBRESSL_2_7_API && OPENSSL_VERSION_NUMBER < 0x10002000L
   auto tls_ctx_data =
       static_cast<TLSContextData *>(SSL_CTX_get_app_data(ssl_ctx));
   auto cert = load_certificate(tls_ctx_data->cert_file);
   auto cert_deleter = defer(X509_free, cert);
-#endif // defined(LIBRESSL_VERSION_NUMBER) || OPENSSL_VERSION_NUMBER <
-       // 0x10002000L
-
-  auto idx = indexed_ssl_ctx.size();
+#endif // !LIBRESSL_2_7_API && OPENSSL_VERSION_NUMBER < 0x10002000L
 
   auto altnames = static_cast<GENERAL_NAMES *>(
       X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
@@ -1557,15 +1607,16 @@ int cert_lookup_tree_add_ssl_ctx(
       auto end_buf = std::copy_n(name, len, std::begin(buf));
       util::inp_strlower(std::begin(buf), end_buf);
 
-      auto nidx = lt->add_cert(StringRef{std::begin(buf), end_buf}, idx);
-      if (nidx == -1) {
+      auto idx = lt->add_cert(StringRef{std::begin(buf), end_buf},
+                              indexed_ssl_ctx.size());
+      if (idx == -1) {
         continue;
       }
-      idx = nidx;
-      if (idx < indexed_ssl_ctx.size()) {
+
+      if (static_cast<size_t>(idx) < indexed_ssl_ctx.size()) {
         indexed_ssl_ctx[idx].push_back(ssl_ctx);
       } else {
-        assert(idx == indexed_ssl_ctx.size());
+        assert(static_cast<size_t>(idx) == indexed_ssl_ctx.size());
         indexed_ssl_ctx.emplace_back(std::vector<SSL_CTX *>{ssl_ctx});
       }
     }
@@ -1597,15 +1648,16 @@ int cert_lookup_tree_add_ssl_ctx(
 
   util::inp_strlower(std::begin(buf), end_buf);
 
-  auto nidx = lt->add_cert(StringRef{std::begin(buf), end_buf}, idx);
-  if (nidx == -1) {
+  auto idx =
+      lt->add_cert(StringRef{std::begin(buf), end_buf}, indexed_ssl_ctx.size());
+  if (idx == -1) {
     return 0;
   }
-  idx = nidx;
-  if (idx < indexed_ssl_ctx.size()) {
+
+  if (static_cast<size_t>(idx) < indexed_ssl_ctx.size()) {
     indexed_ssl_ctx[idx].push_back(ssl_ctx);
   } else {
-    assert(idx == indexed_ssl_ctx.size());
+    assert(static_cast<size_t>(idx) == indexed_ssl_ctx.size());
     indexed_ssl_ctx.emplace_back(std::vector<SSL_CTX *>{ssl_ctx});
   }
 
@@ -1656,7 +1708,7 @@ setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
                          ,
                          neverbleed_t *nb
 #endif // HAVE_NEVERBLEED
-                         ) {
+) {
   auto config = get_config();
 
   if (!upstream_tls_enabled(config->conn)) {
@@ -1671,19 +1723,11 @@ setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
                                     ,
                                     nb
 #endif // HAVE_NEVERBLEED
-                                    );
+  );
 
   all_ssl_ctx.push_back(ssl_ctx);
 
-  if (tlsconf.subcerts.empty()) {
-    return ssl_ctx;
-  }
-
-  if (!cert_tree) {
-    LOG(WARN) << "We have multiple additional certificates (--subcert), but "
-                 "cert_tree is not given.  SNI may not work.";
-    return ssl_ctx;
-  }
+  assert(cert_tree);
 
   if (cert_lookup_tree_add_ssl_ctx(cert_tree, indexed_ssl_ctx, ssl_ctx) == -1) {
     LOG(FATAL) << "Failed to add default certificate.";
@@ -1697,7 +1741,7 @@ setup_server_ssl_context(std::vector<SSL_CTX *> &all_ssl_ctx,
                                       ,
                                       nb
 #endif // HAVE_NEVERBLEED
-                                      );
+    );
     all_ssl_ctx.push_back(ssl_ctx);
 
     if (cert_lookup_tree_add_ssl_ctx(cert_tree, indexed_ssl_ctx, ssl_ctx) ==
@@ -1714,7 +1758,7 @@ SSL_CTX *setup_downstream_client_ssl_context(
 #ifdef HAVE_NEVERBLEED
     neverbleed_t *nb
 #endif // HAVE_NEVERBLEED
-    ) {
+) {
   auto &tlsconf = get_config()->tls;
 
   return create_ssl_client_context(
@@ -1742,7 +1786,7 @@ void setup_downstream_http1_alpn(SSL *ssl) {
 
 std::unique_ptr<CertLookupTree> create_cert_lookup_tree() {
   auto config = get_config();
-  if (!upstream_tls_enabled(config->conn) || config->tls.subcerts.empty()) {
+  if (!upstream_tls_enabled(config->conn)) {
     return nullptr;
   }
   return make_unique<CertLookupTree>();
@@ -1802,6 +1846,230 @@ int proto_version_from_string(const StringRef &v) {
     return TLS1_VERSION;
   }
   return -1;
+}
+
+int verify_ocsp_response(SSL_CTX *ssl_ctx, const uint8_t *ocsp_resp,
+                         size_t ocsp_resplen) {
+
+#if !defined(OPENSSL_NO_OCSP) && !LIBRESSL_IN_USE &&                           \
+    OPENSSL_VERSION_NUMBER >= 0x10002000L
+  int rv;
+
+  STACK_OF(X509) * chain_certs;
+  SSL_CTX_get0_chain_certs(ssl_ctx, &chain_certs);
+
+  auto resp = d2i_OCSP_RESPONSE(nullptr, &ocsp_resp, ocsp_resplen);
+  if (resp == nullptr) {
+    LOG(ERROR) << "d2i_OCSP_RESPONSE failed";
+    return -1;
+  }
+  auto resp_deleter = defer(OCSP_RESPONSE_free, resp);
+
+  ERR_clear_error();
+
+  auto bs = OCSP_response_get1_basic(resp);
+  if (bs == nullptr) {
+    LOG(ERROR) << "OCSP_response_get1_basic failed: "
+               << ERR_error_string(ERR_get_error(), nullptr);
+    return -1;
+  }
+  auto bs_deleter = defer(OCSP_BASICRESP_free, bs);
+
+  auto store = SSL_CTX_get_cert_store(ssl_ctx);
+
+  ERR_clear_error();
+
+  rv = OCSP_basic_verify(bs, chain_certs, store, 0);
+
+  if (rv != 1) {
+    LOG(ERROR) << "OCSP_basic_verify failed: "
+               << ERR_error_string(ERR_get_error(), nullptr);
+    return -1;
+  }
+
+  auto sresp = OCSP_resp_get0(bs, 0);
+  if (sresp == nullptr) {
+    LOG(ERROR) << "OCSP response verification failed: no single response";
+    return -1;
+  }
+
+#if OPENSSL_1_1_API
+  auto certid = OCSP_SINGLERESP_get0_id(sresp);
+#else  // !OPENSSL_1_1_API
+  auto certid = sresp->certId;
+#endif // !OPENSSL_1_1_API
+  assert(certid != nullptr);
+
+  ASN1_INTEGER *serial;
+  rv = OCSP_id_get0_info(nullptr, nullptr, nullptr, &serial,
+                         const_cast<OCSP_CERTID *>(certid));
+  if (rv != 1) {
+    LOG(ERROR) << "OCSP_id_get0_info failed";
+    return -1;
+  }
+
+  if (serial == nullptr) {
+    LOG(ERROR) << "OCSP response does not contain serial number";
+    return -1;
+  }
+
+  auto cert = SSL_CTX_get0_certificate(ssl_ctx);
+  auto cert_serial = X509_get_serialNumber(cert);
+
+  if (ASN1_INTEGER_cmp(cert_serial, serial)) {
+    LOG(ERROR) << "OCSP verification serial numbers do not match";
+    return -1;
+  }
+
+  if (LOG_ENABLED(INFO)) {
+    LOG(INFO) << "OCSP verification succeeded";
+  }
+#endif // !defined(OPENSSL_NO_OCSP) && !LIBRESSL_IN_USE
+       // && OPENSSL_VERSION_NUMBER >= 0x10002000L
+
+  return 0;
+}
+
+ssize_t get_x509_fingerprint(uint8_t *dst, size_t dstlen, const X509 *x,
+                             const EVP_MD *md) {
+  unsigned int len = dstlen;
+  if (X509_digest(x, md, dst, &len) != 1) {
+    return -1;
+  }
+  return len;
+}
+
+namespace {
+StringRef get_x509_name(BlockAllocator &balloc, X509_NAME *nm) {
+  auto b = BIO_new(BIO_s_mem());
+  if (!b) {
+    return StringRef{};
+  }
+
+  auto b_deleter = defer(BIO_free, b);
+
+  // Not documented, but it seems that X509_NAME_print_ex returns the
+  // number of bytes written into b.
+  auto slen = X509_NAME_print_ex(b, nm, 0, XN_FLAG_RFC2253);
+  if (slen <= 0) {
+    return StringRef{};
+  }
+
+  auto iov = make_byte_ref(balloc, slen + 1);
+  BIO_read(b, iov.base, slen);
+  iov.base[slen] = '\0';
+  return StringRef{iov.base, static_cast<size_t>(slen)};
+}
+} // namespace
+
+StringRef get_x509_subject_name(BlockAllocator &balloc, X509 *x) {
+  return get_x509_name(balloc, X509_get_subject_name(x));
+}
+
+StringRef get_x509_issuer_name(BlockAllocator &balloc, X509 *x) {
+  return get_x509_name(balloc, X509_get_issuer_name(x));
+}
+
+#ifdef WORDS_BIGENDIAN
+#define bswap64(N) (N)
+#else /* !WORDS_BIGENDIAN */
+#define bswap64(N)                                                             \
+  ((uint64_t)(ntohl((uint32_t)(N))) << 32 | ntohl((uint32_t)((N) >> 32)))
+#endif /* !WORDS_BIGENDIAN */
+
+StringRef get_x509_serial(BlockAllocator &balloc, X509 *x) {
+#if OPENSSL_1_1_API
+  auto sn = X509_get0_serialNumber(x);
+  uint64_t r;
+  if (ASN1_INTEGER_get_uint64(&r, sn) != 1) {
+    return StringRef{};
+  }
+
+  r = bswap64(r);
+  return util::format_hex(
+      balloc, StringRef{reinterpret_cast<uint8_t *>(&r), sizeof(r)});
+#else  // !OPENSSL_1_1_API
+  auto sn = X509_get_serialNumber(x);
+  auto bn = BN_new();
+  auto bn_d = defer(BN_free, bn);
+  if (!ASN1_INTEGER_to_BN(sn, bn)) {
+    return StringRef{};
+  }
+
+  std::array<uint8_t, 8> b;
+  auto n = BN_bn2bin(bn, b.data());
+  assert(n == b.size());
+
+  return util::format_hex(balloc, StringRef{std::begin(b), std::end(b)});
+#endif // !OPENSSL_1_1_API
+}
+
+namespace {
+// Performs conversion from |at| to time_t.  The result is stored in
+// |t|.  This function returns 0 if it succeeds, or -1.
+int time_t_from_asn1_time(time_t &t, const ASN1_TIME *at) {
+  int rv;
+
+#if OPENSSL_1_1_1_API
+  struct tm tm;
+  rv = ASN1_TIME_to_tm(at, &tm);
+  if (rv != 1) {
+    return -1;
+  }
+
+  t = nghttp2_timegm(&tm);
+#else  // !OPENSSL_1_1_1_API
+  auto b = BIO_new(BIO_s_mem());
+  if (!b) {
+    return -1;
+  }
+
+  auto bio_deleter = defer(BIO_free, b);
+
+  rv = ASN1_TIME_print(b, at);
+  if (rv != 1) {
+    return -1;
+  }
+
+  unsigned char *s;
+  auto slen = BIO_get_mem_data(b, &s);
+  auto tt = util::parse_openssl_asn1_time_print(
+      StringRef{s, static_cast<size_t>(slen)});
+  if (tt == 0) {
+    return -1;
+  }
+
+  t = tt;
+#endif // !OPENSSL_1_1_1_API
+
+  return 0;
+}
+} // namespace
+
+int get_x509_not_before(time_t &t, X509 *x) {
+#if OPENSSL_1_1_API
+  auto at = X509_get0_notBefore(x);
+#else  // !OPENSSL_1_1_API
+  auto at = X509_get_notBefore(x);
+#endif // !OPENSSL_1_1_API
+  if (!at) {
+    return -1;
+  }
+
+  return time_t_from_asn1_time(t, at);
+}
+
+int get_x509_not_after(time_t &t, X509 *x) {
+#if OPENSSL_1_1_API
+  auto at = X509_get0_notAfter(x);
+#else  // !OPENSSL_1_1_API
+  auto at = X509_get_notAfter(x);
+#endif // !OPENSSL_1_1_API
+  if (!at) {
+    return -1;
+  }
+
+  return time_t_from_asn1_time(t, at);
 }
 
 } // namespace tls
