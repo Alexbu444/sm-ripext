@@ -19,6 +19,7 @@
  * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "curlapi.h"
 #include "curlthread.h"
 
 static size_t ReadRequestBody(void *body, size_t size, size_t nmemb, void *userdata)
@@ -56,35 +57,41 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 	CURL *curl = curl_easy_init();
 	if (curl == NULL)
 	{
-		smutils->LogError(myself, "Could not create cURL handle.");
+		forwards->ReleaseForward(this->forward);
+
+		smutils->LogError(myself, "Could not initialize cURL session.");
 		return;
 	}
 
-	char error[CURL_ERROR_SIZE] = {'\0'};
-	char *url = this->client->BuildURL(this->request.endpoint);
+	char caBundlePath[PLATFORM_MAX_PATH];
+	smutils->BuildPath(Path_SM, caBundlePath, sizeof(caBundlePath), SM_RIPEXT_CA_BUNDLE_PATH);
 
-	struct curl_slist *headers = this->client->GetHeaders(this->request);
+	char error[CURL_ERROR_SIZE] = {'\0'};
+	const ke::AString url = this->client->BuildURL(this->request.endpoint);
+
+	struct curl_slist *headers = this->client->BuildHeaders(this->request);
 	struct HTTPResponse response;
 
-	if (strcmp(this->request.method, "POST") == 0)
+	if (this->request.method.compare("POST") == 0)
 	{
 		curl_easy_setopt(curl, CURLOPT_POST, 1L);
 	}
-	else if (strcmp(this->request.method, "PUT") == 0)
+	else if (this->request.method.compare("PUT") == 0)
 	{
 		curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
 	}
-	else if (strcmp(this->request.method, "PATCH") == 0)
+	else if (this->request.method.compare("PATCH") == 0)
 	{
-		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, this->request.method);
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, this->request.method.chars());
 		curl_easy_setopt(curl, CURLOPT_POST, 1L);
 	}
-	else if (strcmp(this->request.method, "DELETE") == 0)
+	else if (this->request.method.compare("DELETE") == 0)
 	{
-		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, this->request.method);
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, this->request.method.chars());
 	}
 
 	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+	curl_easy_setopt(curl, CURLOPT_CAINFO, caBundlePath);
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -94,7 +101,7 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 	curl_easy_setopt(curl, CURLOPT_READDATA, &this->request);
 	curl_easy_setopt(curl, CURLOPT_READFUNCTION, &ReadRequestBody);
 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_URL, url.chars());
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteResponseBody);
 
@@ -104,7 +111,7 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 		curl_easy_cleanup(curl);
 		curl_slist_free_all(headers);
 		free(this->request.body);
-		delete[] url;
+		forwards->ReleaseForward(this->forward);
 
 		smutils->LogError(myself, "HTTP request failed: %s", error);
 		return;
@@ -116,7 +123,6 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 	free(this->request.body);
-	delete[] url;
 
 	g_RipExt.AddCallbackToQueue(HTTPRequestCallback(this->forward, response, this->value));
 }

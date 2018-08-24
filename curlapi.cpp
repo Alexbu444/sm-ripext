@@ -22,25 +22,33 @@
 #include "curlapi.h"
 #include "curlthread.h"
 
-char *HTTPClient::BuildURL(const char *endpoint)
+const ke::AString HTTPClient::BuildURL(const ke::AString &endpoint) const
 {
-	char *url = new char[strlen(this->baseURL) + strlen(endpoint) + 2];
-	strcpy(url, this->baseURL);
+	char *url = new char[this->baseURL.length() + endpoint.length() + 2];
+	strcpy(url, this->baseURL.chars());
 	strcat(url, "/");
-	strcat(url, endpoint);
+	strcat(url, endpoint.chars());
 
-	return url;
+	ke::AString ret(url);
+	delete[] url;
+	return ret;
 }
 
-struct curl_slist *HTTPClient::GetHeaders(struct HTTPRequest request)
+struct curl_slist *HTTPClient::BuildHeaders(struct HTTPRequest request)
 {
 	struct curl_slist *headers = NULL;
 	headers = curl_slist_append(headers, "Accept: application/json");
 	headers = curl_slist_append(headers, "Content-Type: application/json");
 
-	char header[32];
-	smutils->Format(header, sizeof(header), "Content-Length: %d", request.size);
+	char header[8192];
+	snprintf(header, sizeof(header), "Content-Length: %d", request.size);
 	headers = curl_slist_append(headers, header);
+
+	for (HTTPHeaderMap::iterator iter = this->headers.iter(); !iter.empty(); iter.next())
+	{
+		snprintf(header, sizeof(header), "%s: %s", iter->key.chars(), iter->value.chars());
+		headers = curl_slist_append(headers, header);
+	}
 
 	return headers;
 }
@@ -48,8 +56,18 @@ struct curl_slist *HTTPClient::GetHeaders(struct HTTPRequest request)
 void HTTPClient::Request(struct HTTPRequest request, IPluginFunction *function, cell_t value)
 {
 	IChangeableForward *forward = forwards->CreateForwardEx(NULL, ET_Ignore, 2, NULL, Param_Cell, Param_Cell);
-	forward->AddFunction(function);
+	if (forward == NULL || !forward->AddFunction(function))
+	{
+		smutils->LogError(myself, "Could not create forward.");
+		return;
+	}
 
 	HTTPRequestThread *thread = new HTTPRequestThread(this, request, forward, value);
 	threader->MakeThread(thread);
+}
+
+void HTTPClient::SetHeader(const char *name, const char *value)
+{
+	ke::AString vstr(value);
+	this->headers.replace(name, ke::Move(vstr));
 }
