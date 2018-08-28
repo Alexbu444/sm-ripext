@@ -108,12 +108,16 @@ void RipExt::RunFrame()
 	IChangeableForward *forward = callback.forward;
 	struct HTTPResponse response = callback.response;
 	cell_t value = callback.value;
+	const ke::AString error = callback.error;
 
 	this->callbackQueue.pop();
 
 	/* Return early if the plugin was unloaded while the thread was running */
 	if (forward->GetFunctionCount() == 0)
 	{
+		free(response.body);
+		json_decref(response.data);
+
 		forwards->ReleaseForward(forward);
 		this->callbackMutex->Unlock();
 
@@ -124,6 +128,9 @@ void RipExt::RunFrame()
 	Handle_t hndlResponse = handlesys->CreateHandleEx(htHTTPResponseObject, &response, &sec, NULL, NULL);
 	if (hndlResponse == BAD_HANDLE)
 	{
+		free(response.body);
+		json_decref(response.data);
+
 		forwards->ReleaseForward(forward);
 		this->callbackMutex->Unlock();
 
@@ -133,6 +140,7 @@ void RipExt::RunFrame()
 
 	forward->PushCell(hndlResponse);
 	forward->PushCell(value);
+	forward->PushString(error.chars());
 	forward->Execute(NULL);
 
 	handlesys->FreeHandle(hndlResponse, &sec);

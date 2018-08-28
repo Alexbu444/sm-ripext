@@ -63,6 +63,10 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 		return;
 	}
 
+	long connectTimeout = this->client->GetConnectTimeout();
+	long followLocation = this->client->GetFollowLocation();
+	long timeout = this->client->GetTimeout();
+
 	char caBundlePath[PLATFORM_MAX_PATH];
 	smutils->BuildPath(Path_SM, caBundlePath, sizeof(caBundlePath), SM_RIPEXT_CA_BUNDLE_PATH);
 
@@ -92,37 +96,29 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 
 	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 	curl_easy_setopt(curl, CURLOPT_CAINFO, caBundlePath);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connectTimeout);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, followLocation);
 	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 	curl_easy_setopt(curl, CURLOPT_READDATA, &this->request);
 	curl_easy_setopt(curl, CURLOPT_READFUNCTION, &ReadRequestBody);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 	curl_easy_setopt(curl, CURLOPT_URL, url.chars());
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &WriteResponseBody);
 
 	CURLcode res = curl_easy_perform(curl);
-	if (res != CURLE_OK)
+	if (res == CURLE_OK)
 	{
-		curl_easy_cleanup(curl);
-		curl_slist_free_all(headers);
-		free(this->request.body);
-		forwards->ReleaseForward(this->forward);
-
-		smutils->LogError(myself, "HTTP request failed: %s", error);
-		return;
+		response.data = json_loads(response.body, 0, NULL);
+		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
 	}
-
-	response.data = json_loads(response.body, 0, NULL);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
 
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(headers);
 	free(this->request.body);
 
-	g_RipExt.AddCallbackToQueue(HTTPRequestCallback(this->forward, response, this->value));
+	g_RipExt.AddCallbackToQueue(HTTPRequestCallback(this->forward, response, this->value, error));
 }

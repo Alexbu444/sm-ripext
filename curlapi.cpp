@@ -55,7 +55,7 @@ struct curl_slist *HTTPClient::BuildHeaders(struct HTTPRequest request)
 
 void HTTPClient::Request(struct HTTPRequest request, IPluginFunction *function, cell_t value)
 {
-	IChangeableForward *forward = forwards->CreateForwardEx(NULL, ET_Ignore, 2, NULL, Param_Cell, Param_Cell);
+	IChangeableForward *forward = forwards->CreateForwardEx(NULL, ET_Ignore, 3, NULL, Param_Cell, Param_Cell, Param_String);
 	if (forward == NULL || !forward->AddFunction(function))
 	{
 		smutils->LogError(myself, "Could not create forward.");
@@ -70,4 +70,34 @@ void HTTPClient::SetHeader(const char *name, const char *value)
 {
 	ke::AString vstr(value);
 	this->headers.replace(name, ke::Move(vstr));
+}
+
+int HTTPClient::GetConnectTimeout() const
+{
+	return this->connectTimeout;
+}
+
+void HTTPClient::SetConnectTimeout(int connectTimeout)
+{
+	this->connectTimeout = connectTimeout;
+}
+
+bool HTTPClient::GetFollowLocation() const
+{
+	return this->followLocation;
+}
+
+void HTTPClient::SetFollowLocation(bool followLocation)
+{
+	this->followLocation = followLocation;
+}
+
+int HTTPClient::GetTimeout() const
+{
+	return this->timeout;
+}
+
+void HTTPClient::SetTimeout(int timeout)
+{
+	this->timeout = timeout;
 }
