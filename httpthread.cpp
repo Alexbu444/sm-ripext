@@ -52,6 +52,28 @@ static size_t WriteResponseBody(void *body, size_t size, size_t nmemb, void *use
 	return total;
 }
 
+static size_t ReceiveResponseHeader(char *buffer, size_t size, size_t nmemb, void *userdata)
+{
+	size_t total = size * nmemb;
+	struct HTTPResponse *response = (struct HTTPResponse *)userdata;
+
+	char header[CURL_MAX_HTTP_HEADER] = {'\0'};
+	strncat(header, buffer, total - 2); // Strip CRLF
+
+	const char *match = strstr(header, ": ");
+	if (match == NULL)
+	{
+		return total;
+	}
+
+	ke::AString name(header, match - header);
+	ke::AString value(match + 2);
+
+	response->headers.replace(name.chars(), ke::Move(value));
+
+	return total;
+}
+
 void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 {
 	CURL *curl = curl_easy_init();
@@ -99,6 +121,8 @@ void HTTPRequestThread::RunThread(IThreadHandle *pHandle)
 	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, connectTimeout);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error);
 	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, followLocation);
+	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
+	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, &ReceiveResponseHeader);
 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 	curl_easy_setopt(curl, CURLOPT_READDATA, &this->request);
