@@ -67,11 +67,11 @@ struct HTTPResponse {
 };
 
 struct HTTPRequestCallback {
-	HTTPRequestCallback(IChangeableForward *forward, struct HTTPResponse response, cell_t value, const char *error)
+	HTTPRequestCallback(IChangeableForward *forward, struct HTTPResponse &response, cell_t value, const char *error)
 		: forward(forward), response(response), value(value), error(error) {}
 
 	IChangeableForward *forward;
-	struct HTTPResponse response;
+	struct HTTPResponse &response;
 	cell_t value;
 	const ke::AString error;
 };

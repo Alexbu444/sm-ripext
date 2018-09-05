@@ -34,7 +34,7 @@ const ke::AString HTTPClient::BuildURL(const ke::AString &endpoint) const
 	return ret;
 }
 
-struct curl_slist *HTTPClient::BuildHeaders(struct HTTPRequest request)
+struct curl_slist *HTTPClient::BuildHeaders(const struct HTTPRequest &request)
 {
 	struct curl_slist *headers = NULL;
 	headers = curl_slist_append(headers, "Accept: application/json");
@@ -53,7 +53,7 @@ struct curl_slist *HTTPClient::BuildHeaders(struct HTTPRequest request)
 	return headers;
 }
 
-void HTTPClient::Request(struct HTTPRequest request, IPluginFunction *function, cell_t value)
+void HTTPClient::Request(const struct HTTPRequest &request, IPluginFunction *function, cell_t value)
 {
 	IChangeableForward *forward = forwards->CreateForwardEx(NULL, ET_Ignore, 3, NULL, Param_Cell, Param_Cell, Param_String);
 	if (forward == NULL || !forward->AddFunction(function))

@@ -106,7 +106,7 @@ void RipExt::RunFrame()
 
 	struct HTTPRequestCallback &callback = this->callbackQueue.front();
 	IChangeableForward *forward = callback.forward;
-	struct HTTPResponse response = callback.response;
+	struct HTTPResponse &response = callback.response;
 	cell_t value = callback.value;
 	const ke::AString error = callback.error;
 

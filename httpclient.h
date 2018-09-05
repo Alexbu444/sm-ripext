@@ -31,9 +31,9 @@ public:
 
 	const ke::AString BuildURL(const ke::AString &endpoint) const;
 
-	struct curl_slist *BuildHeaders(struct HTTPRequest request);
+	struct curl_slist *BuildHeaders(const struct HTTPRequest &request);
 
-	void Request(struct HTTPRequest request, IPluginFunction *function, cell_t value);
+	void Request(const struct HTTPRequest &request, IPluginFunction *function, cell_t value);
 
 	void SetHeader(const char *name, const char *value);
 
